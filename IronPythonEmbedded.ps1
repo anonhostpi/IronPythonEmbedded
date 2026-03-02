@@ -21,7 +21,7 @@ $ipyVirtualRoot = "/ipy"
 
 # --- Load IronPython assemblies ---
 # TODO: Load from zip via [Assembly]::Load(byte[]) instead of disk
-$ipyRoot = "$env:USERPROFILE\ipyenv\v$ipyVersion"
+$ipyRoot = "$(Resolve-Path "~")\ipyenv\v$ipyVersion"
 [System.Reflection.Assembly]::LoadFrom("$ipyRoot\Microsoft.Scripting.dll") | Out-Null
 [System.Reflection.Assembly]::LoadFrom("$ipyRoot\Microsoft.Dynamic.dll") | Out-Null
 [System.Reflection.Assembly]::LoadFrom("$ipyRoot\IronPython.dll") | Out-Null
@@ -59,6 +59,39 @@ public class LazyZipPAL : PlatformAdaptationLayer {
         _cache = new Hashtable();
         _entryIndex = new Hashtable();
         _zips = new ArrayList();
+    }
+
+    // 1-arg: auto-detect path vs URL, mount all entries at virtualRoot "/"
+    public LazyZipPAL(string pathOrUrl) : this(pathOrUrl, "", "/") {}
+
+    // 3-arg: auto-detect path vs URL with explicit prefix and virtualRoot
+    public LazyZipPAL(string pathOrUrl, string prefix, string virtualRoot) : this() {
+        AddZip(pathOrUrl, prefix, virtualRoot);
+    }
+
+    // 4-arg: local path with URL fallback, explicit prefix and virtualRoot
+    public LazyZipPAL(string localPath, string fallbackUrl, string prefix, string virtualRoot) : this() {
+        if (File.Exists(localPath)) {
+            AddZipFromPath(localPath, prefix, virtualRoot);
+        } else {
+            AddZipFromUrl(fallbackUrl, prefix, virtualRoot);
+        }
+    }
+
+    // Auto-detect: URL (http/https) vs local file path
+    public int AddZip(string pathOrUrl, string prefix, string virtualRoot) {
+        if (pathOrUrl.StartsWith("http://") || pathOrUrl.StartsWith("https://")) {
+            return AddZipFromUrl(pathOrUrl, prefix, virtualRoot);
+        }
+        return AddZipFromPath(pathOrUrl, prefix, virtualRoot);
+    }
+
+    // 2-arg convenience: local path with URL fallback
+    public int AddZip(string localPath, string fallbackUrl, string prefix, string virtualRoot) {
+        if (File.Exists(localPath)) {
+            return AddZipFromPath(localPath, prefix, virtualRoot);
+        }
+        return AddZipFromUrl(fallbackUrl, prefix, virtualRoot);
     }
 
     // --- Additive methods for loading library sources ---
@@ -192,18 +225,9 @@ public class LazyZipPAL : PlatformAdaptationLayer {
 '@
 
 # --- Create PAL and load stdlib zip ---
-$pal = [LazyZipPAL]::new()
-
-# Find local zip, fallback to download URL
+# 4-arg constructor: local path with URL fallback
 $localZip = Join-Path (Split-Path $ipyRoot) "IronPython.$ipyVersion.zip"
-if (Test-Path $localZip) {
-    $count = $pal.AddZipFromPath($localZip, "lib", "$ipyVirtualRoot/lib")
-    Write-Host "Loaded $count stdlib entries from local zip" -ForegroundColor Green
-} else {
-    Write-Host "Downloading IronPython $ipyVersion..." -ForegroundColor Yellow
-    $count = $pal.AddZipFromUrl($ipyReleaseUrl, "lib", "$ipyVirtualRoot/lib")
-    Write-Host "Loaded $count stdlib entries from remote zip" -ForegroundColor Green
-}
+$pal = [LazyZipPAL]::new($localZip, $ipyReleaseUrl, "lib", "$ipyVirtualRoot/lib")
 
 # --- Create IronPython engine ---
 $engine = [IronPython.Hosting.Python]::CreateEngine()
