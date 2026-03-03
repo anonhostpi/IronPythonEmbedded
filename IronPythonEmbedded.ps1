@@ -15,33 +15,26 @@
 #>
 
 # --- Configuration ---
-$ipyVersion = "3.4.2"
-$ipyReleaseUrl = "https://github.com/IronLanguages/ironpython3/releases/download/v$ipyVersion/IronPython.$ipyVersion.zip"
-$ipyVirtualRoot = "/ipy"
+$builder = @{
+    Version = "3.4.2"
+    VRoot = "/ipy"
+    References = @(
+        "Microsoft.Scripting.dll"
+        "Microsoft.Dynamic.dll"
+        "IronPython.dll"
+    )
+    SystemReferences = @(
+        "System.Linq.dll"
+        "System.Collections.dll"
+        "System.Collections.NonGeneric.dll"
+        "System.Runtime.dll"
+        "System.IO.dll"
+        "System.IO.Compression.dll"
+        "System.Net.Http.dll"
+    )
+}
 
-# --- Load IronPython assemblies ---
-# TODO: Load from zip via [Assembly]::Load(byte[]) instead of disk
-$ipyRoot = "$(Resolve-Path "~")\ipyenv\v$ipyVersion"
-[System.Reflection.Assembly]::LoadFrom("$ipyRoot\Microsoft.Scripting.dll") | Out-Null
-[System.Reflection.Assembly]::LoadFrom("$ipyRoot\Microsoft.Dynamic.dll") | Out-Null
-[System.Reflection.Assembly]::LoadFrom("$ipyRoot\IronPython.dll") | Out-Null
-
-# --- Compile LazyZipPAL via Add-Type ---
-$runtimeDir = [System.IO.Path]::GetDirectoryName([object].Assembly.Location)
-$coreLib = [object].Assembly.Location
-
-Add-Type -WarningAction SilentlyContinue -IgnoreWarnings -ReferencedAssemblies @(
-    "$ipyRoot\Microsoft.Scripting.dll"
-    "$ipyRoot\Microsoft.Dynamic.dll"
-    $coreLib
-    "$runtimeDir\System.Linq.dll"
-    "$runtimeDir\System.Collections.dll"
-    "$runtimeDir\System.Collections.NonGeneric.dll"
-    "$runtimeDir\System.Runtime.dll"
-    "$runtimeDir\System.IO.dll"
-    "$runtimeDir\System.IO.Compression.dll"
-    "$runtimeDir\System.Net.Http.dll"
-) -TypeDefinition @'
+$builder.Source = @'
 using System;
 using System.IO;
 using System.IO.Compression;
@@ -224,21 +217,117 @@ public class LazyZipPAL : PlatformAdaptationLayer {
 }
 '@
 
-# --- Create PAL and load stdlib zip ---
-# 4-arg constructor: local path with URL fallback
-$localZip = Join-Path (Split-Path $ipyRoot) "IronPython.$ipyVersion.zip"
-$pal = [LazyZipPAL]::new($localZip, $ipyReleaseUrl, "lib", "$ipyVirtualRoot/lib")
+$builder.PAL = $null
+$builder.Engine = $null
 
-# --- Create IronPython engine ---
-$engine = [IronPython.Hosting.Python]::CreateEngine()
-$paths = $engine.GetSearchPaths()
-$paths.Add("$ipyVirtualRoot/lib")
-$paths.Add("$ipyVirtualRoot/lib/site-packages")
-# Disk fallback — engine's built-in importer uses default PAL, not ours
-# TODO: Wire LazyZipPAL into ScriptHost to eliminate disk dependency
-$paths.Add("$ipyRoot\lib")
-$paths.Add("$ipyRoot\lib\site-packages")
-$engine.SetSearchPaths($paths)
+$builder = New-Object $builder
+
+# Dynamic Props
+$builder | Add-Member -MemberType ScriptProperty -Name URL -Value {
+    return "https://github.com/IronLanguages/ironpython3/releases/download/v$($this.Version)/IronPython.$($this.Version).zip"
+}
+$builder | Add-Member -MemberType ScriptProperty -Name HRoot -Value {
+    "$(Resolve-Path "~")\ipyenv\v$($this.Version)"
+}
+$builder | Add-Member -MemberType ScriptProperty -Name Zip -Value {
+    Join-Path (Split-Path $this.hroot) "IronPython.$($this.Version).zip"
+}
+
+# Methods
+$builder | Add-Member -MemberType ScriptMethod -Name Load -Value {
+    param(
+        [string] $Zip           = $this.Zip,
+        [string] $URL           = $this.Url,
+        [string] $ArchiveRoot   = "lib",
+        [string] $VirtualRoot   = "$($this.VRoot)/lib"
+    )
+
+    $core_lib = [object].Assembly.Location
+    $runtime_directory = [System.IO.Path]::GetDirectoryName($core_lib)
+
+    $assemblies = & {
+        $this.References | ForEach-Object {
+            [System.Reflection.Assembly]::LoadFrom("$($this.hroot)\$_") | Out-Null;
+            return "$($this.hroot)\$_"
+        }
+
+        $core_lib
+
+        $this.SystemReferences | ForEach-Object {
+            return "$runtime_directory\$_"
+        }
+    }
+
+    Add-Type `
+        -WarningAction SilentlyContinue -IgnoreWarnings `
+        -ReferencedAssemblies $assemblies `
+        -TypeDefinition $this.Source
+
+    [int] $count = 0
+    @("$VirtualRoot", "$ArchiveRoot", "$URL", "$Zip") | ForEach-Object {
+        if( [string]::IsNullOrWhiteSpace($_) ){
+            if(0 -ne $count){
+                throw "Invalid Argument Set"
+            }
+        } else {
+            $count++
+        }
+    }
+
+    $this.PAL = switch( $count ){
+        4 {
+            [LazyZipPAL]::new($Zip, $URL, $ArchiveRoot, $VirtualRoot)
+        }
+        3 {
+            [LazyZipPAL]::new($Zip, $URL, $ArchiveRoot, "")
+        }
+        2 {
+            [LazyZipPAL]::new($Zip, $URL, "", "")
+        }
+        1 {
+            [LazyZipPAL]::new($Zip)
+        }
+    }
+}
+
+$builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
+    if( $null -eq $this.PAL ){
+        $this.Load()
+    }
+
+    $this.Engine = [IronPython.Hosting.Python]::CreateEngine()
+    $search_paths = $this.Engine.GetSearchPaths()
+
+    $separator = 
+
+    $paths = @("lib", "lib/site-packages")
+
+    @(
+        @{
+            Path = $builder.VRoot
+            Separator = "/"
+        },
+        @{
+            Path = $builder.HRoot
+            Separator = [System.IO.Path]::DirectorySeparatorChar
+        }
+    ) | ForEach-Object {
+        
+        $root = $_.Path
+        $separator = $_.Separator
+        
+        $paths | ForEach-Object {
+            $path = @(
+                $root
+                $_
+            ) -join $separator
+
+            $search_paths.Add($path)
+        }
+    }
+
+    $this.Engine.SetSearchPaths($search_paths)
+}
 
 # --- Register Python meta_path importer ---
 $_metaPathSetup = @'
@@ -293,7 +382,7 @@ class InMemoryImporter:
 $scope = $engine.CreateScope()
 $scope.SetVariable("pal_instance", $pal)
 $engine.Execute($_metaPathSetup, $scope)
-$engine.Execute("sys.meta_path.insert(0, InMemoryImporter(pal_instance, '$ipyVirtualRoot'))", $scope)
+$engine.Execute("sys.meta_path.insert(0, InMemoryImporter(pal_instance, '$($builder.VRoot)'))", $scope)
 
 # --- Export ---
 @{
