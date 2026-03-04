@@ -384,20 +384,26 @@ $il | Add-Member -MemberType ScriptMethod -Name CreateBridge {
                 -Name "$private_name" `
                 -Value $pair.Value
 
-            Write-Host "DEBUG"
-
             $method_builder = $type_builder.DefineMethod(
                 "$public_name",
                 [MethodAttributes]::Public -bor [MethodAttributes]::Static,
                 [object],
                 [Type[]]@(
                     [Automation.PSObject],
-                    [object]
+                    [object[]]
                 )
+            )
+
+            # Mark second param as params
+            $paramBuilder = $method_builder.DefineParameter(2, [ParameterAttributes]::None, "args")
+            $paramBuilder.SetCustomAttribute(
+                [ParamArrayAttribute].GetConstructor([Type]::EmptyTypes),
+                [byte[]]@(1, 0, 0, 0)
             )
 
             $gen = $method_builder.GetILGenerator()
 
+            # Load PSObject (arg0), read property, get ScriptBlock
             $gen.Emit([Emit.OpCodes]::Ldarg_0)
             $gen.Emit(
                 [Emit.OpCodes]::Callvirt,
@@ -416,15 +422,8 @@ $il | Add-Member -MemberType ScriptMethod -Name CreateBridge {
             )
             $gen.Emit([Emit.OpCodes]::Castclass, [Automation.ScriptBlock])
 
-            # Build object[] { arg1 }
-            $gen.Emit([Emit.OpCodes]::Ldc_I4_1)
-            $gen.Emit([Emit.OpCodes]::Newarr, [object])
-            $gen.Emit([Emit.OpCodes]::Dup)
-            $gen.Emit([Emit.OpCodes]::Ldc_I4_0)
+            # Forward params array directly to InvokeReturnAsIs
             $gen.Emit([Emit.OpCodes]::Ldarg_1)
-            $gen.Emit([Emit.OpCodes]::Stelem_Ref)
-
-            # Call ScriptBlock.InvokeReturnAsIs(object[])
             $gen.Emit(
                 [Emit.OpCodes]::Callvirt,
                 [Automation.ScriptBlock].GetMethod(
@@ -447,7 +446,6 @@ $il | Add-Member -MemberType ScriptMethod -Name CreateBridge {
 
     return $obj
 }
-$test = $il.CreateBridge(@{ Test = { Write-Host "Hello" } })
 
 $importer = $il.CreateBridge(@{
     find_module = {
