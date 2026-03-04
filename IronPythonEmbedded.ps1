@@ -30,7 +30,8 @@ function New-NamespacedObject {
     param(
         $Namespaces,
         $Properties = @(),
-        $Methods = @()
+        $Methods = @(),
+        [scriptblock] $Module = {}
     )
 
     $transpiled = foreach($ns in $Namespaces){
@@ -41,14 +42,18 @@ function New-NamespacedObject {
     $new_namespaced_object_factory = (Get-Item Function:New-NamespacedObject).ScriptBlock
     
     $object = New-Module {
-        param($Transpiled, $NamespacedObjectFactory)
+        param($Transpiled, $NamespacedObjectFactory, $Module)
         Invoke-Expression $Transpiled
         $Transpiled = $null
         Set-Item Function:New-NamespacedObject -Value $NamespacedObjectFactory
         $NamespacedObjectFactory = $null
 
-        $internal = @{}
-    } -ArgumentList $transpiled, $new_namespaced_object_factory
+        . (& {
+            $shadow_module = $Module
+            $Module = $null
+            $shadow_module
+        })
+    } -ArgumentList $transpiled, $new_namespaced_object_factory, $Module
 
     $Properties.GetEnumerator() | ForEach-Object {
         $object | Add-Member -MemberType NoteProperty -Name $_.Name -Value $_.Value
@@ -66,6 +71,7 @@ $virtual_files = New-NamespacedObject `
         Archived = @{}
         Loaded = @{}
         Builtins = @{}
+        Runtime = $null
         Initialized = $false
     } `
     -Methods @{
@@ -361,25 +367,62 @@ $adapter = @{
     load_module = {
         param([string] $Fullname)
 
-        $norm_name = $virtual_files.Normalize($Fullname)
-        
-        foreach($module in @(
-            "$norm_name.py"
-            "$norm_name/__init__.py"
-        )) {
-            $source = $virtual_files.Get($module, $builder.VRoot)
-            if ($null -ne $source) {
-                $mod_scope = $builder.Engine.CreateScope()
-                $builder.Engine.Execute($source, $mod_scope)
+        $rt = $virtual_files.Runtime
 
-                $sys_scope = $builder.Engine.CreateScope()
-                $sys_scope.SetVariable("_mod_scope", $mod_scope)
-                $sys_scope.SetVariable("_mod_name", $Fullname)
-                $builder.Engine.Execute(
-                    "import sys; sys.modules[_mod_name] = _mod_scope", $sys_scope
-                )
+        # Check sys.modules cache
+        [void] $rt.SetVariable("_name", $Fullname)
+        $cached = $builder.Engine.Execute("sys.modules.get(_name)", $rt)
+        if ($null -ne $cached) {
+            return $cached
+        }
 
-                return $mod_scope
+        $norm_name = $builder.ConvertName($Fullname)
+
+        foreach($search_root in @("$($builder.VRoot)", "$($builder.VRoot)/lib", "$($builder.VRoot)/lib/site-packages")) {
+            foreach($candidate in @(
+                "$norm_name.py"
+                "$norm_name/__init__.py"
+            )) {
+                $source = $virtual_files.Get($candidate, $search_root)
+                if ($null -ne $source) {
+                    $is_package = $candidate.EndsWith("__init__.py")
+
+                    # Create proper Python module
+                    $mod = $builder.Engine.Execute("types.ModuleType(_name)", $rt)
+                    [void] $rt.SetVariable("_mod", $mod)
+                    [void] $rt.SetVariable("_loader", $builder)
+
+                    # Set module metadata
+                    [void] $builder.Engine.Execute("_mod.__name__ = _name", $rt)
+                    [void] $builder.Engine.Execute("_mod.__loader__ = _loader", $rt)
+
+                    if ($is_package) {
+                        [void] $rt.SetVariable("_path", "$search_root/$norm_name")
+                        [void] $builder.Engine.Execute(
+                            "_mod.__package__ = _name; _mod.__path__ = [_path]", $rt
+                        )
+                    } else {
+                        [void] $builder.Engine.Execute(
+                            "_mod.__package__ = _name.rpartition('.')[0]", $rt
+                        )
+                    }
+
+                    # Register before executing (prevents circular imports)
+                    [void] $builder.Engine.Execute("sys.modules[_name] = _mod", $rt)
+
+                    # Execute source in module namespace
+                    [void] $rt.SetVariable("_source", $source)
+                    try {
+                        [void] $builder.Engine.Execute(
+                            "exec(compile(_source, _name, 'exec'), _mod.__dict__)", $rt
+                        )
+                    } catch {
+                        [void] $builder.Engine.Execute("sys.modules.pop(_name, None)", $rt)
+                        throw
+                    }
+
+                    return $mod
+                }
             }
         }
         throw "No module named $Fullname"
@@ -445,6 +488,10 @@ $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
         foreach ($name in $builtin_names) {
             $virtual_files.Builtins[$name] = $true
         }
+
+        # Cache types and sys in a persistent scope (before meta_path registration to avoid recursion)
+        $virtual_files.Runtime = $builder.Engine.CreateScope()
+        $builder.Engine.Execute("import types, sys", $virtual_files.Runtime)
 
         # Register on sys.meta_path -- shim normalizes find_module's optional path arg
         $scope = $builder.Engine.CreateScope()
