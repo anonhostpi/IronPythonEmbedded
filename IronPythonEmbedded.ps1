@@ -89,7 +89,7 @@ $virtual_files = Add-NamespacedObject `
                 $suffix = $null
                 switch("$norm_prefix"){
                     ""                                      { $suffix = $norm_path }
-                    { "$norm_path" -like "$norm_prefix/*" } { $suffix = $norm_path.Substring($norm_prefix + 1 ) }
+                    { "$norm_path" -like "$norm_prefix/*" } { $suffix = $norm_path.Substring($norm_prefix.Length + 1) }
                     "$norm_path"                            { return }
                     default                                 { return }
                 }
