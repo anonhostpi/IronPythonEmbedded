@@ -329,161 +329,179 @@ $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
     $this.Engine.SetSearchPaths($search_paths)
 }
 
-$il = @{}
-$il.Module = (nmo { iex "using namespace System.Reflection; using namespace System.Management" })
-$il.Builders = @{}
-$il.Builders.Assembly = $il.Module.Invoke({
-    [Emit.AssemblyBuilder]::DefineDynamicAssembly(
-        [AssemblyName]::new("IPyPwsh"),
-        [Emit.AssemblyBuilderAccess]::Run
-    )
-})
-$il.Builders.Module = $il.Builders.Assembly.DefineDynamicModule("MainModule")
-$il.Builders.Type = $il.Builders.Module.DefineType(
-    "AdapterBridge",
-    $il.Module.Invoke({
-        [TypeAttributes]::Public -bor `
-        [TypeAttributes]::Abstract -bor `
-        [TypeAttributes]::Sealed
+# --- IL Bridge Factory ---
+# Creates CodeMethod-compatible MethodInfo instances that read a named
+# NoteProperty (ScriptBlock) from the PSObject and invoke it with args.
+$il = (nmo { iex "using namespace System.Reflection; using namespace System.Management" })
+
+# Lazy loaded
+$il | Add-Member -MemberType ScriptProperty -Name Assembly -Value {
+    $assembly = $this.Invoke({
+        [Emit.AssemblyBuilder]::DefineDynamicAssembly(
+            [AssemblyName]::new("IPyPwsh"),
+            [Emit.AssemblyBuilderAccess]::Run
+        )
     })
-)
-$il.Builders.Method = $il.Module.Invoke({
-    $il.Builders.Type.DefineMethod(
-        "Invoke",
-        [MethodAttributes]::Public -bor [MethodAttributes]::Static,
-        [object],
-        [Type[]]@(
-            [Automation.PSObject],
-            [object]
-        )
-    )
-})
-$il.Generator = $il.Builders.Method.GetILGenerator()
 
-$il.Module.Invoke({
-    $gen = $il.Generator;
-    $gen.Emit([Emit.OpCodes]::Ldarg_0)
-    $gen.Emit(
-        [Emit.OpCodes]::Callvirt,
-        [Automation.PSObject].GetProperty("Properties").GetGetMethod()
-    )
-    $gen.Emit(
-        [Emit.OpCodes]::Ldstr,
-        "SourceScriptblock"
-    )
-    $gen.Emit(
-        [Emit.OpCodes]::Callvirt,
-        [Automation.PSMemberInfoCollection`1[
-            Automation.PSPropertyInfo
-        ]].GetMethod(
-            "get_Item",
-            [Type[]]@([string])
-        )
-    )
-    $gen.Emit(
-        [Emit.OpCodes]::Callvirt,
-        [Automation.PSPropertyInfo].GetProperty("Value").GetGetMethod()
-    )
-    $gen.Emit(
-        [Emit.OpCodes]::Castclass,
-        [Automation.ScriptBlock]
+    $this | Add-Member -MemberType NoteProperty -Name Assembly -Value $assembly -Force
+
+    return $assembly
+}
+$il | Add-Member -MemberType ScriptProperty -Name Module -Value {
+    $module = $this.Assembly.DefineDynamicModule("MainModule")
+
+    $this | Add-Member -MemberType NoteProperty -Name Module -Value $module -Force
+
+    return $module
+}
+$il | Add-Member -MemberType ScriptMethod -Name CreateBridge {
+    param([hashtable] $Definition)
+
+    $name = [guid]::NewGuid().ToString().ToUpper().Replace("-","_")
+
+    $type_builder = $this.Module.DefineType(
+        $name,
+        $this.Invoke({
+            [TypeAttributes]::Public -bor
+            [TypeAttributes]::Abstract -bor
+            [TypeAttributes]::Sealed
+        })
     )
 
-    # Build a object array:
-    $gen.Emit([Emit.OpCodes]::Ldc_I4_1)
-    $gen.Emit([Emit.OpCodes]::Newarr, [object])
-    $gen.Emit([Emit.OpCodes]::Dup)
-    $gen.Emit([Emit.OpCodes]::Ldc_I4_0)
-    $gen.Emit([Emit.OpCodes]::Ldarg_1)
-    $gen.Emit([Emit.OpCodes]::Stelem_Ref)
+    $obj = New-Object psobject
 
-    $gen.Emit(
-        [Emit.OpCodes]::Callvirt,
-        [Automation.ScriptBlock].GetMethod(
-            "InvokeReturnAsIs",
-            [Type[]]@([object[]])
-        )
-    )
-    $gen.Emit([Emit.OpCodes]::Ret)
-}) | Out-Null
+    foreach ($pair in $Definition.GetEnumerator()) {
+        $this.Invoke({
+            param(
+                $obj, $type_builder, $pair
+            )
 
-$il.Type = $il.Builders.Type.CreateType()
-$il.Method = $il.Type.GetMethod("Invoke")
+            $public_name = $pair.Name
+            $private_name = "_$public_name"
 
-$test = New-Object psobject @{
-    SourceScriptblock = {
-        param($x)
-        $x.ToUpper()
+            $obj | Add-Member `
+                -MemberType NoteProperty `
+                -Name "$private_name" `
+                -Value $pair.Value
+
+            Write-Host "DEBUG"
+
+            $method_builder = $type_builder.DefineMethod(
+                "$public_name",
+                [MethodAttributes]::Public -bor [MethodAttributes]::Static,
+                [object],
+                [Type[]]@(
+                    [Automation.PSObject],
+                    [object]
+                )
+            )
+
+            $gen = $method_builder.GetILGenerator()
+
+            $gen.Emit([Emit.OpCodes]::Ldarg_0)
+            $gen.Emit(
+                [Emit.OpCodes]::Callvirt,
+                [Automation.PSObject].GetProperty("Properties").GetGetMethod()
+            )
+            $gen.Emit([Emit.OpCodes]::Ldstr, "$private_name")
+            $gen.Emit(
+                [Emit.OpCodes]::Callvirt,
+                [Automation.PSMemberInfoCollection`1[
+                    Automation.PSPropertyInfo
+                ]].GetMethod("get_Item", [Type[]]@([string]))
+            )
+            $gen.Emit(
+                [Emit.OpCodes]::Callvirt,
+                [Automation.PSPropertyInfo].GetProperty("Value").GetGetMethod()
+            )
+            $gen.Emit([Emit.OpCodes]::Castclass, [Automation.ScriptBlock])
+
+            # Build object[] { arg1 }
+            $gen.Emit([Emit.OpCodes]::Ldc_I4_1)
+            $gen.Emit([Emit.OpCodes]::Newarr, [object])
+            $gen.Emit([Emit.OpCodes]::Dup)
+            $gen.Emit([Emit.OpCodes]::Ldc_I4_0)
+            $gen.Emit([Emit.OpCodes]::Ldarg_1)
+            $gen.Emit([Emit.OpCodes]::Stelem_Ref)
+
+            # Call ScriptBlock.InvokeReturnAsIs(object[])
+            $gen.Emit(
+                [Emit.OpCodes]::Callvirt,
+                [Automation.ScriptBlock].GetMethod(
+                    "InvokeReturnAsIs",
+                    [Type[]]@([object[]])
+                )
+            )
+            $gen.Emit([Emit.OpCodes]::Ret)
+        }, $obj, $type_builder, $pair) | Out-Null
     }
+            
+    $type = $type_builder.CreateType()
+    
+    $Definition.Keys | ForEach-Object {
+        $obj | Add-Member `
+            -MemberType CodeMethod `
+            -Name "$_" `
+            -Value $type.GetMethod("$_")
+    }
+
+    return $obj
 }
-$test | Add-Member -MemberType NoteProperty -Name SourceScriptblock -Value {
-    param($x)
-    $x.ToUpper()
-}
-$test | Add-Member -MemberType CodeMethod -Name Test -Value $il.Method
-$test.Test("Hi there!")
+$test = $il.CreateBridge(@{ Test = { Write-Host "Hello" } })
 
-
-
-
-# --- Register Python meta_path importer ---
-$_metaPathSetup = @'
-import sys, types, clr
-import System
-
-class InMemoryImporter:
-    def __init__(self, pal, virtual_root):
-        self.pal = pal
-        self.root = virtual_root
-
-    def find_module(self, fullname, path=None):
-        parts = fullname.replace('.', '/')
-        for c in [self.root + '/' + parts + '.py',
-                   self.root + '/' + parts + '/__init__.py']:
-            if self.pal.FileExists(c):
-                return self
-        return None
-
-    def load_module(self, fullname):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-        parts = fullname.replace('.', '/')
-        for filepath in [self.root + '/' + parts + '.py',
-                          self.root + '/' + parts + '/__init__.py']:
-            if self.pal.FileExists(filepath):
-                stream = self.pal.OpenFileStream(
-                    filepath,
-                    System.IO.FileMode.Open,
-                    System.IO.FileAccess.Read,
-                    System.IO.FileShare.Read,
+$importer = $il.CreateBridge(@{
+    find_module = {
+        param($fullname)
+        $parts = $fullname.Replace('.', '/')
+        $root = $this.root
+        $candidates = @("$root/$parts.py", "$root/$parts/__init__.py")
+        foreach ($c in $candidates) {
+            if ($pal.FileExists($c)) { return $this }
+        }
+        return $null
+    }
+    load_module = {
+        param($fullname)
+        $parts = $fullname.Replace('.', '/')
+        $root = $this.root
+        foreach ($filepath in @("$root/$parts.py", "$root/$parts/__init__.py")) {
+            if ($pal.FileExists($filepath)) {
+                $stream = $pal.OpenFileStream(
+                    $filepath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::Read,
                     8192
                 )
-                buf = System.IO.MemoryStream()
-                stream.CopyTo(buf)
-                source = System.Text.Encoding.UTF8.GetString(buf.ToArray())
-                stream.Close()
-                mod = types.ModuleType(fullname)
-                mod.__file__ = filepath
-                mod.__loader__ = self
-                if filepath.endswith('__init__.py'):
-                    mod.__path__ = [self.root + '/' + parts]
-                    mod.__package__ = fullname
-                else:
-                    mod.__package__ = fullname.rpartition('.')[0]
-                sys.modules[fullname] = mod
-                exec(compile(source, filepath, 'exec'), mod.__dict__)
-                return mod
-        raise ImportError('No module named ' + fullname)
-'@
+                $buf = [System.IO.MemoryStream]::new()
+                $stream.CopyTo($buf)
+                $source = [System.Text.Encoding]::UTF8.GetString($buf.ToArray())
+                $stream.Close()
 
-$scope = $engine.CreateScope()
-$scope.SetVariable("pal_instance", $pal)
-$engine.Execute($_metaPathSetup, $scope)
-$engine.Execute("sys.meta_path.insert(0, InMemoryImporter(pal_instance, '$($builder.VRoot)'))", $scope)
+                $modScope = $engine.CreateScope()
+                $engine.Execute($source, $modScope)
+
+                $scope.SetVariable("_mod_scope", $modScope)
+                $scope.SetVariable("_mod_name", $fullname)
+                $engine.Execute("import sys; sys.modules[_mod_name] = _mod_scope", $scope)
+
+                return $modScope
+            }
+        }
+        throw "No module named $fullname"
+    }
+})
+
+# --- Register PSObject importer on sys.meta_path ---
+$scope = $builder.Engine.CreateScope()
+$scope.SetVariable("importer", $importer)
+$builder.Engine.Execute("import sys; sys.meta_path.insert(0, importer)", $scope)
 
 # --- Export ---
 @{
-    Engine = $engine
-    Scope  = $scope
-    PAL    = $pal
+    Engine   = $builder.Engine
+    Scope    = $scope
+    PAL      = $builder.PAL
+    Importer = $importer
+    Builder  = $builder
 }
