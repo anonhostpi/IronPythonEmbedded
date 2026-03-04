@@ -29,19 +29,26 @@ $builder = @{
 function New-NamespacedObject {
     param(
         $Namespaces,
-        $Properties,
-        $Methods
+        $Properties = @(),
+        $Methods = @()
     )
 
     $transpiled = foreach($ns in $Namespaces){
         "using namespace $ns"
     }
     $transpiled = $transpiled -join "`n"
+
+    $new_namespaced_object_factory = (Get-Item Function:New-NamespacedObject).ScriptBlock
     
     $object = New-Module {
-        param($Transpiled)
+        param($Transpiled, $NamespacedObjectFactory)
         Invoke-Expression $Transpiled
-    } -ArgumentList $transpiled
+        $Transpiled = $null
+        Set-Item Function:New-NamespacedObject -Value $NamespacedObjectFactory
+        $NamespacedObjectFactory = $null
+
+        $internal = @{}
+    } -ArgumentList $transpiled, $new_namespaced_object_factory
 
     $Properties.GetEnumerator() | ForEach-Object {
         $object | Add-Member -MemberType NoteProperty -Name $_.Name -Value $_.Value
