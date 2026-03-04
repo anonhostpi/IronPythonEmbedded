@@ -366,6 +366,12 @@ $adapter = @{
     }
 }
 
+$builder | Add-Member -MemberType ScriptMethod -Name ConvertName -Value {
+    param([string] $Fullname)
+
+    $virtual_files.Normalize($Fullname).Replace('.', '/')
+}
+
 # ScriptMethods -- PowerShell-callable (PascalCase)
 $builder | Add-Member -MemberType ScriptMethod -Name    FindModule `
     -Value                                              $adapter.find_module
