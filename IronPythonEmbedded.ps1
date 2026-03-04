@@ -329,6 +329,103 @@ $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
     $this.Engine.SetSearchPaths($search_paths)
 }
 
+$il = @{}
+$il.Module = (nmo { iex "using namespace System.Reflection; using namespace System.Management" })
+$il.Builders = @{}
+$il.Builders.Assembly = $il.Module.Invoke({
+    [Emit.AssemblyBuilder]::DefineDynamicAssembly(
+        [AssemblyName]::new("IPyPwsh"),
+        [Emit.AssemblyBuilderAccess]::Run
+    )
+})
+$il.Builders.Module = $il.Builders.Assembly.DefineDynamicModule("MainModule")
+$il.Builders.Type = $il.Builders.Module.DefineType(
+    "AdapterBridge",
+    $il.Module.Invoke({
+        [TypeAttributes]::Public -bor `
+        [TypeAttributes]::Abstract -bor `
+        [TypeAttributes]::Sealed
+    })
+)
+$il.Builders.Method = $il.Module.Invoke({
+    $il.Builders.Type.DefineMethod(
+        "Invoke",
+        [MethodAttributes]::Public -bor [MethodAttributes]::Static,
+        [object],
+        [Type[]]@(
+            [Automation.PSObject],
+            [object]
+        )
+    )
+})
+$il.Generator = $il.Builders.Method.GetILGenerator()
+
+$il.Module.Invoke({
+    $gen = $il.Generator;
+    $gen.Emit([Emit.OpCodes]::Ldarg_0)
+    $gen.Emit(
+        [Emit.OpCodes]::Callvirt,
+        [Automation.PSObject].GetProperty("Properties").GetGetMethod()
+    )
+    $gen.Emit(
+        [Emit.OpCodes]::Ldstr,
+        "SourceScriptblock"
+    )
+    $gen.Emit(
+        [Emit.OpCodes]::Callvirt,
+        [Automation.PSMemberInfoCollection`1[
+            Automation.PSPropertyInfo
+        ]].GetMethod(
+            "get_Item",
+            [Type[]]@([string])
+        )
+    )
+    $gen.Emit(
+        [Emit.OpCodes]::Callvirt,
+        [Automation.PSPropertyInfo].GetProperty("Value").GetGetMethod()
+    )
+    $gen.Emit(
+        [Emit.OpCodes]::Castclass,
+        [Automation.ScriptBlock]
+    )
+
+    # Build a object array:
+    $gen.Emit([Emit.OpCodes]::Ldc_I4_1)
+    $gen.Emit([Emit.OpCodes]::Newarr, [object])
+    $gen.Emit([Emit.OpCodes]::Dup)
+    $gen.Emit([Emit.OpCodes]::Ldc_I4_0)
+    $gen.Emit([Emit.OpCodes]::Ldarg_1)
+    $gen.Emit([Emit.OpCodes]::Stelem_Ref)
+
+    $gen.Emit(
+        [Emit.OpCodes]::Callvirt,
+        [Automation.ScriptBlock].GetMethod(
+            "InvokeReturnAsIs",
+            [Type[]]@([object[]])
+        )
+    )
+    $gen.Emit([Emit.OpCodes]::Ret)
+}) | Out-Null
+
+$il.Type = $il.Builders.Type.CreateType()
+$il.Method = $il.Type.GetMethod("Invoke")
+
+$test = New-Object psobject @{
+    SourceScriptblock = {
+        param($x)
+        $x.ToUpper()
+    }
+}
+$test | Add-Member -MemberType NoteProperty -Name SourceScriptblock -Value {
+    param($x)
+    $x.ToUpper()
+}
+$test | Add-Member -MemberType CodeMethod -Name Test -Value $il.Method
+$test.Test("Hi there!")
+
+
+
+
 # --- Register Python meta_path importer ---
 $_metaPathSetup = @'
 import sys, types, clr
