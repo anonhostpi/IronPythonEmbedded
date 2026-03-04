@@ -105,7 +105,7 @@ $virtual_files = Add-NamespacedObject `
 
             $this.Loaded[$VirtualPath] = $Bytes
             if( $this.Archived.ContainsKey($VirtualPath) ){
-                $this.Archived[$VirtualPath].Dispose()
+                $this.Archived.Remove($VirtualPath)
             }
         }
         Auto = {
