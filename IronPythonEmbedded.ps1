@@ -22,8 +22,6 @@ $builder = @{
     Version = "3.4.2"
     VRoot = "/ipy"
     References = @(
-        "Microsoft.Scripting.dll"
-        "Microsoft.Dynamic.dll"
         "IronPython.dll"
     )
 }
