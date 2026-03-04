@@ -26,7 +26,7 @@ $builder = @{
     )
 }
 
-function Add-NamespacedObject {
+function New-NamespacedObject {
     param(
         $Namespaces,
         $Properties,
@@ -53,7 +53,7 @@ function Add-NamespacedObject {
     return $object
 }
 
-$virtual_files = Add-NamespacedObject `
+$virtual_files = New-NamespacedObject `
     -Namespaces "System.IO","System.IO.Compression","System.Text" `
     -Properties @{
         Archived = @{}
@@ -206,7 +206,9 @@ $virtual_files = Add-NamespacedObject `
 
 $builder.Engine = $null
 
-$builder = New-Object psobject -Property $builder
+$builder = New-NamespacedObject `
+    -Namespaces "System.Management.Automation" `
+    -Properties $builder
 
 # Dynamic Props
 $builder | Add-Member -MemberType ScriptProperty -Name URL -Value {
