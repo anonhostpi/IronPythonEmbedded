@@ -334,6 +334,17 @@ $adapter = @{
         if ($virtual_files.Builtins.ContainsKey($Fullname)) {
             return $null
         }
+
+        $norm_name = $builder.ConvertName($Fullname)
+
+        foreach($search_root in @("$($builder.VRoot)", "$($builder.VRoot)/lib", "$($builder.VRoot)/lib/site-packages")) {
+            foreach($candidate in @(
+                "$norm_name.py"
+                "$norm_name/__init__.py"
+            )) {
+                if ($virtual_files.Exists($candidate, $search_root)) {
+                    return $builder
+                }
             }
         }
         return $null
