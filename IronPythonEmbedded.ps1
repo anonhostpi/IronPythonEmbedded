@@ -53,6 +53,8 @@ function New-NamespacedObject {
             $Module = $null
             $shadow_module
         })
+
+        Export-ModuleMember
     } -ArgumentList $transpiled, $new_namespaced_object_factory, $Module
 
     $Properties.GetEnumerator() | ForEach-Object {
