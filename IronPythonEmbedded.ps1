@@ -14,6 +14,8 @@
     Requires PowerShell 7+ (pwsh) for .NET Core/.NET 8+ compatibility with IronPython 3.4.x
 #>
 
+return (nmo {
+
 # --- Configuration ---
 $builder = @{
     Version = "3.4.2"
@@ -386,4 +388,4 @@ $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
 }
 
 # --- Export ---
-return $builder
+}).Invoke({ $builder })
