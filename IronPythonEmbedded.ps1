@@ -4,11 +4,12 @@
     Single-file embeddable IronPython for PowerShell.
 
 .DESCRIPTION
-    Compiles a custom PlatformAdaptationLayer (LazyZipPAL) via Add-Type that:
-    - Accepts zip archives (local path or URL) as Python library sources
-    - Lazily extracts files on demand (zero startup overhead)
-    - Supports multiple zips (stdlib, vendored packages, user libraries)
-    - Falls back to real filesystem for anything not in the zips
+    Pure PowerShell IronPython embedding with:
+    - Lazy zip extraction for stdlib and vendored packages
+    - In-memory module loading via sys.meta_path
+    - No Add-Type / no C# compilation
+    - Supports multiple zip sources (local path or URL)
+    - Falls back to real filesystem for stdlib
 
 .NOTES
     Requires PowerShell 7+ (pwsh) for .NET Core/.NET 8+ compatibility with IronPython 3.4.x
@@ -25,201 +26,185 @@ $builder = @{
         "Microsoft.Dynamic.dll"
         "IronPython.dll"
     )
-    SystemReferences = @(
-        "System.Linq.dll"
-        "System.Collections.dll"
-        "System.Collections.NonGeneric.dll"
-        "System.Runtime.dll"
-        "System.IO.dll"
-        "System.IO.Compression.dll"
-        "System.Net.Http.dll"
-    )
 }
 
-$builder.Source = @'
-using System;
-using System.IO;
-using System.IO.Compression;
-using System.Collections;
-using System.Linq;
-using System.Net.Http;
-using Microsoft.Scripting;
+function Add-NamespacedObject {
+    param(
+        $Namespaces,
+        $Properties,
+        $Methods
+    )
 
-public class LazyZipPAL : PlatformAdaptationLayer {
-    private Hashtable _cache;       // virtual path -> byte[] (lazy-populated)
-    private Hashtable _entryIndex;  // virtual path -> ZipArchiveEntry
-    private ArrayList _zips;        // open ZipArchive instances (kept alive for lazy reads)
+    $transpiled = foreach($ns in $Namespaces){
+        "using namespace $ns"
+    }
+    $transpiled = $transpiled -join "`n"
+    
+    $object = New-Module {
+        param($Transpiled)
+        Invoke-Expression $Transpiled
+    } -ArgumentList $transpiled
 
-    public LazyZipPAL() {
-        _cache = new Hashtable();
-        _entryIndex = new Hashtable();
-        _zips = new ArrayList();
+    $Properties.GetEnumerator() | ForEach-Object {
+        $object | Add-Member -MemberType NoteProperty -Name $_.Name -Value $_.Value
+    }
+    $Methods.GetEnumerator() | ForEach-Object {
+        $object | Add-Member -MemberType ScriptMethod -Name $_.Name -Value $_.Value
     }
 
-    // 1-arg: auto-detect path vs URL, mount all entries at virtualRoot "/"
-    public LazyZipPAL(string pathOrUrl) : this(pathOrUrl, "", "/") {}
+    return $object
+}
 
-    // 3-arg: auto-detect path vs URL with explicit prefix and virtualRoot
-    public LazyZipPAL(string pathOrUrl, string prefix, string virtualRoot) : this() {
-        AddZip(pathOrUrl, prefix, virtualRoot);
-    }
+$virtual_files = Add-NamespacedObject `
+    -Namespaces "System.IO","System.IO.Compression","System.Text" `
+    -Properties @{
+        Archived = @{}
+        Loaded = @{}
+        Initialized = $false
+    } `
+    -Methods @{
+        Normalize = {
+            param([string] $Path)
 
-    // 4-arg: local path with URL fallback, explicit prefix and virtualRoot
-    public LazyZipPAL(string localPath, string fallbackUrl, string prefix, string virtualRoot) : this() {
-        if (File.Exists(localPath)) {
-            AddZipFromPath(localPath, prefix, virtualRoot);
-        } else {
-            AddZipFromUrl(fallbackUrl, prefix, virtualRoot);
+            return $Path.Replace('\', '/')
         }
-    }
+        AddArchive = {
+            param(
+                [IO.Stream] $Stream,
+                [string]    $Prefix,
+                [string]    $VirtualRoot
+            )
 
-    // Auto-detect: URL (http/https) vs local file path
-    public int AddZip(string pathOrUrl, string prefix, string virtualRoot) {
-        if (pathOrUrl.StartsWith("http://") || pathOrUrl.StartsWith("https://")) {
-            return AddZipFromUrl(pathOrUrl, prefix, virtualRoot);
-        }
-        return AddZipFromPath(pathOrUrl, prefix, virtualRoot);
-    }
+            $zip = $this.Invoke({
+                param([IO.Stream] $Stream)
 
-    // 2-arg convenience: local path with URL fallback
-    public int AddZip(string localPath, string fallbackUrl, string prefix, string virtualRoot) {
-        if (File.Exists(localPath)) {
-            return AddZipFromPath(localPath, prefix, virtualRoot);
-        }
-        return AddZipFromUrl(fallbackUrl, prefix, virtualRoot);
-    }
+                [ZipArchive]::new($Stream, [ZipArchiveMode]::Read)
+            }, $Stream)
 
-    // --- Additive methods for loading library sources ---
+            $norm_prefix    = $this.Normalize($Prefix).TrimEnd('/')
+            $norm_root      = $this.Normalize($VirtualRoot).TrimEnd('/')
 
-    // Add a zip from a local file path, mapping entries under a virtual root.
-    // prefix: the path prefix inside the zip to map (e.g. "lib/")
-    // virtualRoot: where to mount them (e.g. "/ipy/lib")
-    public int AddZipFromPath(string path, string prefix, string virtualRoot) {
-        var stream = File.OpenRead(path);
-        var zip = new ZipArchive(stream, ZipArchiveMode.Read);
-        return AddZipInternal(zip, prefix, virtualRoot);
-    }
+            foreach ($entry in $Zip.Entries) {
+                $norm_path  = $this.Normalize($entry.FullName)
+                if ($norm_path.EndsWith('/')) { continue }
 
-    // Add a zip from a byte array (e.g. downloaded into memory)
-    public int AddZipFromBytes(byte[] data, string prefix, string virtualRoot) {
-        var stream = new MemoryStream(data);
-        var zip = new ZipArchive(stream, ZipArchiveMode.Read);
-        return AddZipInternal(zip, prefix, virtualRoot);
-    }
+                $suffix = $null
+                switch("$norm_prefix"){
+                    ""                                      { $suffix = $norm_path }
+                    { "$norm_path" -like "$norm_prefix/*" } { $suffix = $norm_path.Substring($norm_prefix + 1 ) }
+                    "$norm_path"                            { return }
+                    default                                 { return }
+                }
 
-    // Add a zip from a URL (downloads into memory)
-    public int AddZipFromUrl(string url, string prefix, string virtualRoot) {
-        using (var client = new HttpClient()) {
-            var data = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
-            return AddZipFromBytes(data, prefix, virtualRoot);
-        }
-    }
-
-    private int AddZipInternal(ZipArchive zip, string prefix, string virtualRoot) {
-        _zips.Add(zip);
-        string norm_prefix = prefix.Replace("\\", "/").TrimEnd('/');
-        string norm_root = virtualRoot.Replace("\\", "/").TrimEnd('/');
-        int count = 0;
-        foreach (var entry in zip.Entries) {
-            string name = entry.FullName.Replace("\\", "/");
-            if (name.EndsWith("/")) continue; // skip directories
-
-            if (norm_prefix.Length == 0 || name.StartsWith(norm_prefix + "/") || name == norm_prefix) {
-                string suffix = norm_prefix.Length == 0
-                    ? name
-                    : name.Substring(norm_prefix.Length + 1);
-                string virtualPath = norm_root + "/" + suffix;
-                _entryIndex[virtualPath] = entry;
-                count++;
+                $this.Archived["$norm_root/$suffix"] = $entry
             }
         }
-        return count;
-    }
+        Load = {
+            param(
+                [string] $VirtualPath,
+                [byte[]] $Bytes
+            )
 
-    // Add a single file directly (e.g. inline Python code)
-    public void AddFile(string virtualPath, byte[] content) {
-        _cache[virtualPath] = content;
-        if (!_entryIndex.ContainsKey(virtualPath)) {
-            _entryIndex[virtualPath] = null;
-        }
-    }
-
-    // --- PAL overrides ---
-
-    private string Norm(string path) {
-        return path.Replace("\\", "/");
-    }
-
-    private bool IsKnown(string path) {
-        return _cache.ContainsKey(path) || _entryIndex.ContainsKey(path);
-    }
-
-    private byte[] Resolve(string path) {
-        if (_cache.ContainsKey(path)) {
-            return (byte[])_cache[path];
-        }
-        if (_entryIndex.ContainsKey(path) && _entryIndex[path] != null) {
-            var entry = (ZipArchiveEntry)_entryIndex[path];
-            using (var stream = entry.Open()) {
-                var ms = new MemoryStream();
-                stream.CopyTo(ms);
-                byte[] data = ms.ToArray();
-                _cache[path] = data;
-                return data;
+            $this.Loaded[$VirtualPath] = $Bytes
+            if( $this.Archived.ContainsKey($VirtualPath) ){
+                $this.Archived[$VirtualPath].Dispose()
             }
         }
-        return null;
-    }
+        Auto = {
+            param(
+                [string] $VirtualPath,
+                $Content
+            )
 
-    public override bool FileExists(string path) {
-        return IsKnown(Norm(path)) || base.FileExists(path);
-    }
+            $bytes = $this.Invoke({
+                param($Content)
 
-    public override Stream OpenFileStream(string path, FileMode mode, FileAccess access, FileShare share, int bufferSize) {
-        string n = Norm(path);
-        byte[] data = Resolve(n);
-        if (data != null) {
-            return new MemoryStream(data, false);
-        }
-        return base.OpenFileStream(path, mode, access, share, bufferSize);
-    }
-
-    public override bool DirectoryExists(string path) {
-        string prefix = Norm(path).TrimEnd('/') + "/";
-        foreach (string key in _entryIndex.Keys) {
-            if (key.StartsWith(prefix)) return true;
-        }
-        return base.DirectoryExists(path);
-    }
-
-    public override string[] GetFileSystemEntries(string path, string searchPattern, bool includeFiles, bool includeDirectories) {
-        string prefix = Norm(path).TrimEnd('/') + "/";
-        var matches = new ArrayList();
-        var dirs = new Hashtable();
-        foreach (string key in _entryIndex.Keys) {
-            if (key.StartsWith(prefix)) {
-                var rest = key.Substring(prefix.Length);
-                int slash = rest.IndexOf('/');
-                if (slash < 0 && includeFiles) {
-                    matches.Add(key);
-                } else if (slash >= 0 && includeDirectories) {
-                    string dir = prefix + rest.Substring(0, slash);
-                    if (!dirs.ContainsKey(dir)) {
-                        dirs[dir] = true;
-                        matches.Add(dir);
+                switch($Content.GetType()) {
+                    ([byte[]]) {
+                        $Content
+                    }
+                    ([string]) {
+                        If (Test-Path $Content) {
+                            [File]::ReadAllBytes($Content)
+                        } Else {
+                            [Encoding]::UTF8.GetBytes($Content)
+                        }
+                    }
+                    default {
+                        throw "Content must be byte[], a file path string, or inline text"
                     }
                 }
+            }, $Content)
+
+            $this.Load($VirtualPath, $bytes)
+        }
+        Exists = {
+            param(
+                [string] $Path,
+                [string] $Prefix
+            )
+
+            $norm_path = $this.Normalize($Path)
+            $norm_prefix = $this.Normalize($Prefix).TrimEnd('/')
+
+            If( -not [string]::IsNullOrEmpty($norm_prefix) ){
+                $norm_path = "$norm_prefix/$norm_path"
+            }
+            
+            foreach($store in @(
+                $this.Loaded,
+                $this.Archived
+            )) {
+                if ($store.ContainsKey($norm_path)) { return $true }
             }
         }
-        try {
-            matches.AddRange(base.GetFileSystemEntries(path, searchPattern, includeFiles, includeDirectories));
-        } catch {}
-        return (string[])matches.ToArray(typeof(string));
-    }
-}
-'@
+        Get = {
+            param(
+                [string] $Path,
+                [string] $Prefix
+            )
 
-$builder.PAL = $null
+            $norm_path = $this.Normalize($Path)
+            $norm_prefix = $this.Normalize($Prefix).TrimEnd('/')
+
+            If( -not [string]::IsNullOrEmpty($norm_prefix) ){
+                $norm_path = "$norm_prefix/$norm_path"
+            }
+
+            $this.Invoke({
+                param(
+                    $VirtualFiles,
+                    [string] $Normalized
+                )
+
+                $loaded = $VirtualFiles.Loaded
+
+                If ($loaded.ContainsKey($Normalized)) {
+                    return [Encoding]::UTF8.GetString([byte[]] $loaded[$Normalized])
+                }
+                
+                $archived = $VirtualFiles.Archived
+
+                If ($archived.ContainsKey($Normalized)) {
+                    [ZipArchiveEntry] $entry = $archived[$Normalized]
+
+                    $stream = $entry.Open()
+                    $ms = [MemoryStream]::new()
+                    $stream.CopyTo($ms)
+
+                    $bytes = $ms.ToArray()
+                    $stream.Close()
+
+                    $VirtualFiles.Load($Normalized, $bytes)
+
+                    return [Encoding]::UTF8.GetString($bytes)
+                }
+
+                return $null
+            }, $this, $norm_path)
+        }
+    }
+
 $builder.Engine = $null
 
 $builder = New-Object psobject -Property $builder
@@ -232,69 +217,174 @@ $builder | Add-Member -MemberType ScriptProperty -Name HRoot -Value {
     "$(Resolve-Path "~")\ipyenv\v$($this.Version)"
 }
 $builder | Add-Member -MemberType ScriptProperty -Name Zip -Value {
-    Join-Path (Split-Path $this.hroot) "IronPython.$($this.Version).zip"
+    Join-Path (Split-Path $this.HRoot) "IronPython.$($this.Version).zip"
 }
 
-# Methods
-$builder | Add-Member -MemberType ScriptMethod -Name Load -Value {
+# --- Zip management methods ---
+
+$builder | Add-Member -MemberType ScriptMethod -Name FromPath -Value {
     param(
-        [string] $Zip           = $this.Zip,
-        [string] $URL           = $this.Url,
-        [string] $ArchiveRoot   = "lib",
-        [string] $VirtualRoot   = "$($this.VRoot)/lib"
+        [string] $Path,
+        [string] $Prefix,
+        [string] $VirtualRoot
     )
 
-    $core_lib = [object].Assembly.Location
-    $runtime_directory = [System.IO.Path]::GetDirectoryName($core_lib)
+    return $virtual_files.AddArchive(
+        [System.IO.File]::OpenRead($Path)
+    )
+}
 
-    $assemblies = & {
-        $this.References | ForEach-Object {
-            [System.Reflection.Assembly]::LoadFrom("$($this.hroot)\$_") | Out-Null;
-            return "$($this.hroot)\$_"
-        }
+$builder | Add-Member -MemberType ScriptMethod -Name FromUrl -Value {
+    param(
+        [string] $Url,
+        [string] $Prefix,
+        [string] $VirtualRoot
+    )
 
-        $core_lib
-
-        $this.SystemReferences | ForEach-Object {
-            return "$runtime_directory\$_"
-        }
+    $data = & {
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.GetByteArrayAsync($Url).GetAwaiter().GetResult()
+        $client.Dispose() | Out-Null
     }
 
-    Add-Type `
-        -WarningAction SilentlyContinue -IgnoreWarnings `
-        -ReferencedAssemblies $assemblies `
-        -TypeDefinition $this.Source
+    return $this.FromBytes($data, $Prefix, $VirtualRoot)
+}
 
-    [int] $count = 0
-    @("$VirtualRoot", "$ArchiveRoot", "$URL", "$Zip") | ForEach-Object {
-        if( [string]::IsNullOrWhiteSpace($_) ){
-            if(0 -ne $count){
-                throw "Invalid Argument Set"
-            }
-        } else {
-            $count++
-        }
+$builder | Add-Member -MemberType ScriptMethod -Name FromBytes -Value {
+    param(
+        [byte[]] $Data,
+        [string] $Prefix,
+        [string] $VirtualRoot
+    )
+
+    return $virtual_files.AddArchive(
+        [System.IO.MemoryStream]::new($Data)
+    )
+}
+
+$builder | Add-Member -MemberType ScriptMethod -Name From -Value {
+    param(
+        [string]$Location,
+        [string]$Prefix,
+        [string]$VirtualRoot
+    )
+
+    switch -Wildcard ($Location) {
+        "http://*"  {}
+        "https://*" {}
+        default     { return $this.FromPath($Location, $Prefix, $VirtualRoot) }
     }
 
-    $this.PAL = switch( $count ){
-        4 {
-            [LazyZipPAL]::new($Zip, $URL, $ArchiveRoot, $VirtualRoot)
-        }
-        3 {
-            [LazyZipPAL]::new($Zip, $URL, $ArchiveRoot, "")
-        }
-        2 {
-            [LazyZipPAL]::new($Zip, $URL, "", "")
-        }
-        1 {
-            [LazyZipPAL]::new($Zip)
-        }
+    $this.FromUrl($Location, $Prefix, $VirtualRoot)
+}
+
+$builder | Add-Member -MemberType ScriptMethod -Name AddFile -Value {
+    param(
+        [string]$VirtualPath,
+        $Content
+    )
+
+    $virtual_files.Auto($VirtualPath, $Content)
+}
+
+# --- File resolution methods ---
+
+$builder | Add-Member -MemberType ScriptMethod -Name Has -Value {
+    param([string]$Path)
+
+    return $virtual_files.Exists($Path)
+}
+
+# --- Load assemblies ---
+
+$builder | Add-Member -MemberType ScriptMethod -Name Load -Value {
+    param(
+        [string]$Zip = $this.Zip,
+        [string]$URL = $this.URL,
+        [string]$ArchiveRoot = "lib",
+        [string]$VirtualRoot = "$($this.VRoot)/lib"
+    )
+
+    $virtual_files.Initialized = $true
+
+    $this.References | ForEach-Object {
+        [System.Reflection.Assembly]::LoadFrom("$($this.HRoot)\$_") | Out-Null
+    }
+
+    if (Test-Path $Zip) {
+        $this.FromPath($Zip, $ArchiveRoot, $VirtualRoot)
+    } else {
+        $this.FromUrl($URL, $ArchiveRoot, $VirtualRoot)
     }
 }
+
+# --- Python import adapter ---
+
+$adapter = @{
+    find_module = {
+        param(
+            [string] $Fullname,
+            $path
+        )
+
+        $norm_name = $virtual_files.Normalize($Fullname)
+        
+        foreach($module in @(
+            "$norm_name.py"
+            "$norm_name/__init__.py"
+        )) {
+            if ($virtual_files.Exists($module, $builder.VRoot)) {
+                return $builder
+            }
+        }
+        return $null
+    }
+    load_module = {
+        param([string] $Fullname)
+
+        $norm_name = $virtual_files.Normalize($Fullname)
+        
+        foreach($module in @(
+            "$norm_name.py"
+            "$norm_name/__init__.py"
+        )) {
+            $source = $virtual_files.Get($module, $builder.VRoot)
+            if ($null -ne $source) {
+                $mod_scope = $builder.Engine.CreateScope()
+                $builder.Engine.Execute($source, $mod_scope)
+
+                $sys_scope = $builder.Engine.CreateScope()
+                $sys_scope.SetVariable("_mod_scope", $mod_scope)
+                $sys_scope.SetVariable("_mod_name", $Fullname)
+                $builder.Engine.Execute(
+                    "import sys; sys.modules[_mod_name] = _mod_scope", $sys_scope
+                )
+
+                return $mod_scope
+            }
+        }
+        throw "No module named $Fullname"
+    }
+}
+
+# ScriptMethods -- PowerShell-callable (PascalCase)
+$builder | Add-Member -MemberType ScriptMethod -Name    FindModule `
+    -Value                                              $adapter.find_module
+
+$builder | Add-Member -MemberType ScriptMethod -Name    LoadModule `
+    -Value                                              $adapter.load_module
+
+# Func NoteProperties -- Python-callable (snake_case)
+$builder | Add-Member -MemberType NoteProperty -Name    find_module `
+    -Value ([Func[string, object, object]]              $adapter.find_module)
+$builder | Add-Member -MemberType NoteProperty -Name    load_module `
+    -Value ([Func[string, object]]                      $adapter.load_module)
+
+# --- Start engine ---
 
 $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
     & {
-        if( $null -eq $this.PAL ){
+        if (-not $virtual_files.Initialized) {
             $this.Load()
         }
 
@@ -304,88 +394,26 @@ $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
         $paths = @("lib", "lib/site-packages")
 
         @(
-            @{
-                Path = $this.VRoot
-                Separator = "/"
-            },
-            @{
-                Path = $this.HRoot
-                Separator = [System.IO.Path]::DirectorySeparatorChar
-            }
+            @{ Path = $this.VRoot;  Separator = "/" },
+            @{ Path = $this.HRoot;  Separator = [System.IO.Path]::DirectorySeparatorChar }
         ) | ForEach-Object {
-            
             $root = $_.Path
-            $separator = $_.Separator
-            
+            $sep = $_.Separator
             $paths | ForEach-Object {
-                $path = @(
-                    $root
-                    $_
-                ) -join $separator
-
-                $search_paths.Add($path)
+                $search_paths.Add(@($root, $_) -join $sep)
             }
         }
 
         $this.Engine.SetSearchPaths($search_paths)
 
-        # Scriptblock implementations
-        $findModuleSB = {
-            param([string]$fullname, $path)
-            $parts = $fullname.Replace('.', '/')
-            $root = $builder.VRoot
-            $candidates = @("$root/$parts.py", "$root/$parts/__init__.py")
-            foreach ($c in $candidates) {
-                if ($builder.PAL.FileExists($c)) { return $builder }
-            }
-            return $null
-        }
-        $loadModuleSB = {
-            param([string]$fullname)
-            $parts = $fullname.Replace('.', '/')
-            $root = $builder.VRoot
-            foreach ($filepath in @("$root/$parts.py", "$root/$parts/__init__.py")) {
-                if ($builder.PAL.FileExists($filepath)) {
-                    $stream = $builder.PAL.OpenFileStream(
-                        $filepath,
-                        [System.IO.FileMode]::Open,
-                        [System.IO.FileAccess]::Read,
-                        [System.IO.FileShare]::Read,
-                        8192
-                    )
-                    $buf = [System.IO.MemoryStream]::new()
-                    $stream.CopyTo($buf)
-                    $source = [System.Text.Encoding]::UTF8.GetString($buf.ToArray())
-                    $stream.Close()
-
-                    $modScope = $builder.Engine.CreateScope()
-                    $builder.Engine.Execute($source, $modScope)
-
-                    $sysScope = $builder.Engine.CreateScope()
-                    $sysScope.SetVariable("_mod_scope", $modScope)
-                    $sysScope.SetVariable("_mod_name", $fullname)
-                    $builder.Engine.Execute("import sys; sys.modules[_mod_name] = _mod_scope", $sysScope)
-
-                    return $modScope
-                }
-            }
-            throw "No module named $fullname"
-        }
-
-        # ScriptMethods — PowerShell-callable (PascalCase)
-        $builder | Add-Member -MemberType ScriptMethod -Name FindModule -Force -Value $findModuleSB
-        $builder | Add-Member -MemberType ScriptMethod -Name LoadModule -Force -Value $loadModuleSB
-
-        # Func NoteProperties — Python-callable (snake_case)
-        $builder | Add-Member -MemberType NoteProperty -Name find_module -Force -Value ([Func[string, object, object]]$findModuleSB)
-        $builder | Add-Member -MemberType NoteProperty -Name load_module -Force -Value ([Func[string, object]]$loadModuleSB)
-
-        # Register on sys.meta_path — shim normalizes find_module's optional path arg
+        # Register on sys.meta_path -- shim normalizes find_module's optional path arg
         $scope = $builder.Engine.CreateScope()
         $scope.SetVariable("_importer", $builder)
         $builder.Engine.Execute("import sys; sys.meta_path.insert(0, type('Shim',(),{'find_module':lambda s,n,p=None:_importer.find_module(n,p),'load_module':lambda s,n:_importer.load_module(n)})())", $scope)
     } | Out-Null
 }
 
-# --- Export ---
+# --- Lock/internalize exports ---
+Export-ModuleMember
+# --- Actual export ---
 }).Invoke({ $builder })
