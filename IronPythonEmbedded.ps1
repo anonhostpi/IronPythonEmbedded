@@ -58,6 +58,7 @@ $virtual_files = Add-NamespacedObject `
     -Properties @{
         Archived = @{}
         Loaded = @{}
+        Builtins = @{}
         Initialized = $false
     } `
     -Methods @{
@@ -329,14 +330,10 @@ $adapter = @{
             $path
         )
 
-        $norm_name = $virtual_files.Normalize($Fullname)
-        
-        foreach($module in @(
-            "$norm_name.py"
-            "$norm_name/__init__.py"
-        )) {
-            if ($virtual_files.Exists($module, $builder.VRoot)) {
-                return $builder
+        # Skip modules with C# built-in implementations
+        if ($virtual_files.Builtins.ContainsKey($Fullname)) {
+            return $null
+        }
             }
         }
         return $null
@@ -407,6 +404,21 @@ $builder | Add-Member -MemberType ScriptMethod -Name Start -Value {
         }
 
         $this.Engine.SetSearchPaths($search_paths)
+
+        # Collect built-in module names (C# implementations that must not be shadowed by .py files)
+        $scope = $builder.Engine.CreateScope()
+        $builder.Engine.Execute(
+            "import sys, _sre, sre_compile, sre_parse, sre_constants, re",
+            $scope
+        )
+        $builtin_names = $builder.Engine.Execute(
+            "[k for k,v in sys.modules.items() if not getattr(v, '__file__', None)]",
+            $scope
+        )
+        $virtual_files.Builtins = @{}
+        foreach ($name in $builtin_names) {
+            $virtual_files.Builtins[$name] = $true
+        }
 
         # Register on sys.meta_path -- shim normalizes find_module's optional path arg
         $scope = $builder.Engine.CreateScope()
