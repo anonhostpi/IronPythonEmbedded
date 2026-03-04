@@ -228,7 +228,9 @@ $builder | Add-Member -MemberType ScriptMethod -Name FromPath -Value {
     )
 
     return $virtual_files.AddArchive(
-        [System.IO.File]::OpenRead($Path)
+        [System.IO.File]::OpenRead($Path),
+        $Prefix,
+        $VirtualRoot
     )
 }
 
@@ -256,7 +258,9 @@ $builder | Add-Member -MemberType ScriptMethod -Name FromBytes -Value {
     )
 
     return $virtual_files.AddArchive(
-        [System.IO.MemoryStream]::new($Data)
+        [System.IO.MemoryStream]::new($Data),
+        $Prefix,
+        $VirtualRoot
     )
 }
 
