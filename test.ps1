@@ -1,28 +1,27 @@
 $builder = . "$PSScriptRoot\IronPythonEmbedded.ps1"
-
-$builder.Load()
-$builder.Start()
+$engine = $builder.Build()
 
 # Test: inline
-$scope = $builder.Engine.CreateScope()
-$result = $builder.Engine.Execute("2 + 2", $scope)
+$scope = $engine.CreateScope()
+$result = $engine.Execute("2 + 2", $scope)
 Write-Host "Inline: 2+2 = $result" -ForegroundColor Green
 
-# Test: in-memory module via AddFile
-$builder.AddFile("$($builder.VRoot)/testmod.py", "def add(a,b): return a+b")
-$result = $builder.Engine.Execute("import testmod; testmod.add(5, 3)", $scope)
-Write-Host "In-memory import: add(5,3) = $result" -ForegroundColor Green
-
 # Test: stdlib import
-$builder.Engine.Execute("import json", $scope)
+$engine.Execute("import json", $scope)
 Write-Host "Stdlib json: OK" -ForegroundColor Green
 
-# Test: ScriptMethod from PowerShell (PascalCase)
-$result = $builder.FindModule("testmod")
-Write-Host "FindModule('testmod') from PS: $($null -ne $result)" -ForegroundColor Cyan
+# Test: stdlib with actual usage
+$result = $engine.Execute("json.dumps({chr(97): 1, chr(98): 2})", $scope)
+Write-Host "json.dumps: $result" -ForegroundColor Green
 
-# Test: Func NoteProperty from PowerShell (needs .Invoke)
-$result2 = $builder.find_module.Invoke("testmod", $null)
-Write-Host "find_module.Invoke('testmod') from PS: $($null -ne $result2)" -ForegroundColor Cyan
+# Test: stdlib package with submodules
+$engine.Execute("import os.path", $scope)
+Write-Host "os.path: OK" -ForegroundColor Green
+
+# Test: in-memory module via Add
+$engine.Add("/ipy/testmod.py", "def add(a,b): return a+b")
+$engine.Execute("import testmod", $scope)
+$result = $engine.Execute("testmod.add(5, 3)", $scope)
+Write-Host "In-memory import: add(5,3) = $result" -ForegroundColor Green
 
 Write-Host "`nDone" -ForegroundColor Green
